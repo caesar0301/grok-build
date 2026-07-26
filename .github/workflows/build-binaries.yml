@@ -1,0 +1,155 @@
+# Build release `grok` binaries for the personal-use branch only.
+#
+# Targets:
+#   - macOS Intel      (x86_64-apple-darwin)     → grok-macos-x86_64
+#   - macOS Apple Silicon (aarch64-apple-darwin) → grok-macos-aarch64
+#   - Linux x86_64     (x86_64-unknown-linux-gnu) → grok-linux-x86_64
+#   - Linux ARM64      (aarch64-unknown-linux-gnu) → grok-linux-aarch64
+#
+# Artifact: target/release binary renamed to match the official install layout.
+
+name: Build binaries
+
+on:
+  push:
+    branches: [feat/for-personal-use]
+  pull_request:
+    branches: [feat/for-personal-use]
+  workflow_dispatch:
+
+concurrency:
+  group: build-binaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep CI builds from trying to talk to a TTY / browser.
+  RUSTFLAGS: "-C strip=symbols"
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: grok-macos-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: grok-macos-aarch64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: grok-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: grok-linux-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            cmake \
+            clang \
+            libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Matches rust-toolchain.toml; host target is auto-added.
+          toolchain: "1.92.0"
+          targets: ${{ matrix.target }}
+
+      - name: Install DotSlash (for bin/protoc)
+        run: |
+          cargo install --locked --version 0.5.7 dotslash
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          /usr/bin/env dotslash --help >/dev/null
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: grok-${{ matrix.target }}
+          cache-targets: true
+          cache-all-crates: true
+
+      - name: Verify protoc via DotSlash
+        run: |
+          ./bin/protoc --version
+          echo "PROTOC=$(pwd)/bin/protoc" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: |
+          cargo build -p xai-grok-pager-bin --release --target "${{ matrix.target }}"
+
+      - name: Package artifact
+        run: |
+          src="target/${{ matrix.target }}/release/xai-grok-pager"
+          test -x "$src"
+          # Official install layout ships the binary as `grok-<os>-<arch>`.
+          out="dist/${{ matrix.artifact }}"
+          mkdir -p dist
+          cp "$src" "$out"
+          chmod +x "$out"
+          # Extra strip when the toolchain didn't fully strip (best-effort).
+          if command -v strip >/dev/null 2>&1; then
+            strip "$out" || true
+          fi
+          ls -lh "$out"
+          file "$out" || true
+          "./$out" --version || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # Convenience job: one downloadable zip with all four binaries.
+  bundle:
+    name: Bundle all platforms
+    needs: build
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: grok-*
+          merge-multiple: false
+
+      - name: Assemble bundle
+        run: |
+          mkdir -p bundle
+          # download-artifact lays out one dir per artifact name
+          find artifacts -type f -name 'grok-*' -exec cp {} bundle/ \;
+          ls -lh bundle
+          (
+            cd bundle
+            sha256sum grok-* | tee SHA256SUMS
+          )
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-binaries-${{ github.sha }}
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 30
