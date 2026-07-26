@@ -205,12 +205,18 @@ pub fn stream_chat_completions<'a>(
                     let mut name_for_event: Option<String> = None;
                     let mut args_for_event: Option<String> = None;
 
-                    if let Some(id) = tc_delta.id {
+                    // Some OpenAI-compatible providers (notably DashScope GLM)
+                    // emit continuation deltas with explicit empty-string
+                    // `id` / `function.name` instead of omitting the fields.
+                    // Overwriting here would wipe the real values from the
+                    // first chunk and leave the final ToolCall with empty
+                    // name/id (tool dispatch failure → HTTP 400 on follow-up).
+                    if let Some(id) = tc_delta.id.filter(|s| !s.is_empty()) {
                         entry.0 = id.clone();
                         id_for_event = Some(id);
                     }
                     if let Some(func) = tc_delta.function {
-                        if let Some(name) = func.name {
+                        if let Some(name) = func.name.filter(|s| !s.is_empty()) {
                             entry.1 = name.clone();
                             name_for_event = Some(name);
                         }
@@ -575,6 +581,87 @@ mod tests {
                 assert_eq!(calls[0].arguments.as_ref(), "{\"x\":1}");
                 // Tool calls force ToolCalls stop reason.
                 assert_eq!(response.stop_reason, Some(StopReason::ToolCalls));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_call_stream_ignores_empty_id_and_name_continuations() {
+        // DashScope GLM-style stream: first delta carries id+name, later
+        // deltas repeat empty strings for those fields while appending args.
+        let chunk1 = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("call_abc".into()),
+                kind: Some("function".into()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("read_file".into()),
+                    arguments: Some("{\"target_file\":".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+        let chunk2 = make_chunk(vec![ChatChunkDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ChunkToolCallDelta {
+                index: 0,
+                id: Some("".into()),
+                kind: Some("function".into()),
+                function: Some(ToolCallFunctionDelta {
+                    name: Some("".into()),
+                    arguments: Some("\"x.toml\"}".into()),
+                }),
+            }],
+            tool_call_id: None,
+        }]);
+
+        let raw = stream::iter::<Vec<Result<ChatCompletionChunk, SamplingError>>>(vec![
+            Ok(chunk1),
+            Ok(chunk2),
+        ])
+        .boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let deltas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SamplingEvent::ToolCallDelta {
+                    id,
+                    name,
+                    arguments_delta,
+                    ..
+                } => Some((id.clone(), name.clone(), arguments_delta.clone())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].0.as_deref(), Some("call_abc"));
+        assert_eq!(deltas[0].1.as_deref(), Some("read_file"));
+        // Empty id/name must not be re-emitted (would wipe UI / accumulators).
+        assert_eq!(deltas[1].0, None);
+        assert_eq!(deltas[1].1, None);
+        assert_eq!(deltas[1].2.as_deref(), Some("\"x.toml\"}"));
+
+        match events.last().unwrap() {
+            SamplingEvent::Completed { response, .. } => {
+                let calls = response.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id.as_ref(), "call_abc");
+                assert_eq!(calls[0].name, "read_file");
+                assert_eq!(calls[0].arguments.as_ref(), "{\"target_file\":\"x.toml\"}");
             }
             other => panic!("expected Completed, got {other:?}"),
         }
