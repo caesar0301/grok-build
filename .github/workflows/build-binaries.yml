@@ -1,24 +1,26 @@
-# Build release `grok` binaries for the personal-use branch only.
+# Build release `grok` binaries for main.
 #
 # Targets:
-#   - macOS Intel      (x86_64-apple-darwin)     → grok-macos-x86_64
-#   - macOS Apple Silicon (aarch64-apple-darwin) → grok-macos-aarch64
+#   - macOS Intel      (x86_64-apple-darwin)      → grok-macos-x86_64
+#   - macOS Apple Silicon (aarch64-apple-darwin)  → grok-macos-aarch64
 #   - Linux x86_64     (x86_64-unknown-linux-gnu) → grok-linux-x86_64
 #   - Linux ARM64      (aarch64-unknown-linux-gnu) → grok-linux-aarch64
 #
-# Artifact: target/release binary renamed to match the official install layout.
+# Manual dispatch (Actions → Build binaries → Run workflow) creates a GitHub
+# Release tagged with a UTC timestamp to the second (e.g. v20260727-012230)
+# and attaches all platform binaries + SHA256SUMS as downloadable assets.
 
 name: Build binaries
 
 on:
   push:
-    branches: [feat/for-personal-use]
+    branches: [main]
   pull_request:
-    branches: [feat/for-personal-use]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: build-binaries-${{ github.workflow }}-${{ github.ref }}
+  group: build-binaries-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
@@ -26,12 +28,33 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep CI builds from trying to talk to a TTY / browser.
   RUSTFLAGS: "-C strip=symbols"
 
 jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+    steps:
+      - name: Compute version / release flag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="v$(date -u +'%Y%m%d-%H%M%S')"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Release version: ${version}"
+          else
+            echo "version=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "CI build only (no GitHub Release)"
+          fi
+
   build:
     name: ${{ matrix.artifact }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -100,12 +123,10 @@ jobs:
         run: |
           src="target/${{ matrix.target }}/release/xai-grok-pager"
           test -x "$src"
-          # Official install layout ships the binary as `grok-<os>-<arch>`.
           out="dist/${{ matrix.artifact }}"
           mkdir -p dist
           cp "$src" "$out"
           chmod +x "$out"
-          # Extra strip when the toolchain didn't fully strip (best-effort).
           if command -v strip >/dev/null 2>&1; then
             strip "$out" || true
           fi
@@ -121,10 +142,10 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Convenience job: one downloadable zip with all four binaries.
+  # Push/CI: one downloadable zip with all four binaries (workflow artifacts).
   bundle:
     name: Bundle all platforms
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
     if: github.event_name != 'pull_request'
     steps:
@@ -138,7 +159,6 @@ jobs:
       - name: Assemble bundle
         run: |
           mkdir -p bundle
-          # download-artifact lays out one dir per artifact name
           find artifacts -type f -name 'grok-*' -exec cp {} bundle/ \;
           ls -lh bundle
           (
@@ -149,7 +169,47 @@ jobs:
       - name: Upload bundle
         uses: actions/upload-artifact@v4
         with:
-          name: grok-binaries-${{ github.sha }}
+          name: grok-binaries-${{ needs.prepare.outputs.version }}
           path: bundle/
           if-no-files-found: error
           retention-days: 30
+
+  # Manual dispatch only: create a timestamped GitHub Release with downloadable assets.
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build, bundle]
+    runs-on: ubuntu-24.04
+    if: needs.prepare.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-binaries-${{ needs.prepare.outputs.version }}
+          path: release-assets
+
+      - name: Create release ${{ needs.prepare.outputs.version }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -lh release-assets
+          short_sha="${GITHUB_SHA:0:7}"
+          notes="Manual release built from \`${short_sha}\` on \`main\`.
+
+          Version tag is a UTC timestamp to the second: \`${VERSION}\`.
+
+          ### Assets
+          - \`grok-macos-x86_64\` — macOS Intel
+          - \`grok-macos-aarch64\` — macOS Apple Silicon
+          - \`grok-linux-x86_64\` — Linux x86_64
+          - \`grok-linux-aarch64\` — Linux ARM64
+          - \`SHA256SUMS\` — checksums"
+          gh release create "${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --title "grok ${VERSION}" \
+            --notes "${notes}" \
+            --target "${GITHUB_SHA}" \
+            release-assets/*
